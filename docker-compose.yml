@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: foxbit_backend
+    restart: always
+    ports:
+      - "8006:8006"
+    environment:
+      - DATABASE_URL=postgresql://postgres.dpalspcavpcfamivjlbm:H9w5U2c%3FidnMw%25f@aws-1-us-east-1.pooler.supabase.com:6543/postgres
+    # volumes:
+    #   - ./data:/app/data
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: foxbit_frontend
+    restart: always
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend

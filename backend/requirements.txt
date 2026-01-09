@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+backtrader
+requests
+pandas
+pydantic
+pydantic-settings
+sqlalchemy
+python-dotenv
+websockets
+aiofiles
+matplotlib
+psycopg2-binary
