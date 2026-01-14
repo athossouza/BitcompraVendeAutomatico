@@ -10,7 +10,9 @@ import asyncio
 from .storage import models, database
 from .foxbit_client.client import FoxbitClient
 from .paper_broker.broker import PaperBroker, Order
+from .paper_broker.real_broker import RealBroker
 from .risk_engine.engine import RiskEngine, TradeRisk
+import os
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +35,7 @@ get_db = database.get_db
 # Global State (In-memory for V1 simplicity of the simulation loop)
 class GlobalSystemState:
     is_running = False
-    broker = PaperBroker(initial_balance=120.0)
+    broker = None # Initialized in __init__
     risk_engine = RiskEngine(TradeRisk())
     client = FoxbitClient()
     active_strategy = "StrategyA"
@@ -42,10 +44,25 @@ class GlobalSystemState:
     last_update: float = 0.0
     health_metrics: dict = {}
     fatal_error: Optional[str] = None
+    entry_price: float = 0.0 # Track average entry price
 
     def __init__(self):
         self.health_metrics = {}
         self.fatal_error = None
+        
+        # Initialize Broker based on Mode
+        mode = os.getenv("TRADING_MODE", "PAPER").upper()
+        if mode == "LIVE":
+             logger.warning("🚨 SYSTEM STARTING IN LIVE TRADING MODE (BINANCE) 🚨")
+             try:
+                 self.broker = RealBroker()
+             except Exception as e:
+                 logger.critical(f"Failed to initialize RealBroker: {e}")
+                 self.fatal_error = str(e)
+                 self.broker = PaperBroker(initial_balance=120.0) # Fallback to prevent crash
+        else:
+             logger.info("ℹ️ System starting in PAPER TRADING mode.")
+             self.broker = PaperBroker(initial_balance=120.0)
 
     def log(self, message: str, level: str = "INFO"):
         """Add log message to in-memory list"""
@@ -65,6 +82,45 @@ state = GlobalSystemState()
 @app.on_event("startup")
 def startup_event():
     models.Base.metadata.create_all(bind=database.engine)
+    
+    # Restore State from DB
+    try:
+        db = database.SessionLocal()
+        last_trade = db.query(models.Trade).order_by(models.Trade.entered_at.desc()).first()
+        if last_trade and last_trade.side == "buy" and last_trade.status == "filled":
+             # Restore Holdings and Entry Price
+             qty = float(last_trade.quantity)
+             entry = float(last_trade.entry_price)
+             cost = qty * entry
+             
+             state.entry_price = entry
+
+             # Handling Logic based on Mode
+             if isinstance(state.broker, RealBroker):
+                 # LIVE MODE: Trust the Broker (Binance) for Balance/Holdings.
+                 # Only restore Entry Price if we actually hold BTC.
+                 if state.broker.holdings > 0:
+                      logger.info(f"🔄 LIVE State Restored: Resuming Real Long Position. Entry: {entry} | Holdings: {state.broker.holdings} (Binance)")
+                 else:
+                      logger.warning(f"⚠️ State Mismatch: DB says bought at {entry}, but Binance Holdings are 0. Assuming FLAT.")
+                      state.entry_price = 0.0 # Reset entry price as we have no position
+             else:
+                 # PAPER MODE: Restore Virtual State
+                 state.broker.holdings = qty
+                 # Fix Balance Mismatch: If balance is "Full" (e.g. 126) but we should be invested, deduct cost.
+                 if state.broker.balance > (cost * 0.5):
+                     state.broker.balance -= cost
+                     logger.warning(f"⚠️ Adjusted Balance: Deducted {cost:.2f} BRL to match Open Position.")
+                 logger.info(f"🔄 PAPER State Restored: Resuming Virtual Position. Entry: {entry} | Qty: {qty} | Bal: {state.broker.balance:.2f}")
+        else:
+             if last_trade:
+                 logger.info(f"ℹ️ State Restoration Skipped: Last trade {last_trade.side} ({last_trade.status})")
+             else:
+                 logger.info("ℹ️ State Restoration Skipped: No trades found in DB.")
+        db.close()
+    except Exception as e:
+        logger.error(f"Failed to restore state: {e}")
+
     # Start Market Data Loop
     asyncio.create_task(market_data_loop())
 
@@ -233,7 +289,8 @@ async def trading_loop():
                 if short_ma > (long_ma * (1 + signal_threshold)) and not in_cooldown:
                     balance = state.broker.balance
                     if balance > 10: # Min balance
-                        quantity_to_buy = (balance * 0.8) / current_price
+                        # Use 98% of balance to maximize compounding (leaving 2% buffer for price fluctuation/fees)
+                        quantity_to_buy = (balance * 0.98) / current_price
                         risk_check = state.risk_engine.validate_trade(symbol, "buy", quantity_to_buy, current_price, total_equity)
                         
                         if risk_check["allowed"]:
@@ -244,6 +301,7 @@ async def trading_loop():
                             )
                             state.broker.place_order(order)
                             last_trade_time = time.time()
+                            state.entry_price = current_price # Track entry for TP
                             logger.info(f"SIGNAL BUY @ {current_price} (Strength: {((short_ma/long_ma)-1)*100:.3f}%)")
 
                 # --- PROFIT PROTECTION (TRAILING STOP) ---
@@ -265,7 +323,23 @@ async def trading_loop():
                              )
                              state.broker.place_order(order)
                              last_trade_time = time.time()
+                             last_trade_time = time.time()
+                             state.entry_price = 0.0 # Reset entry
                              logger.info(f"PROTECTION SELL @ {current_price} (Profit Lock - Price crossed ShortMA)")
+
+                # --- FIXED TAKE PROFIT (4%) ---
+                if state.broker.holdings > 0.00001 and state.entry_price > 0:
+                    profit_pct = (current_price - state.entry_price) / state.entry_price
+                    if profit_pct >= 0.04: # 4% target
+                        logger.info(f"💰 TAKE PROFIT TRIGGERED! Profit: {profit_pct*100:.2f}% (Target: 4.0%)")
+                        order = Order(
+                             id=str(int(time.time()*1000)),
+                             symbol=symbol, side="sell", quantity=state.broker.holdings,
+                             price=current_price, type="market"
+                        )
+                        state.broker.place_order(order)
+                        state.entry_price = 0.0
+                        last_trade_time = time.time()
 
 
                 # --- SELL SIGNAL ---

@@ -1,0 +1,25 @@
+#!/usr/bin/expect -f
+set timeout 1200
+set password "@Ahs221400#123"
+set host "191.252.191.249"
+set user "root"
+
+# 1. Sync ALL backend code (including new files)
+spawn rsync -avz --exclude 'node_modules' --exclude '.venv' --exclude '__pycache__' -e "ssh -o StrictHostKeyChecking=no" backend/app/ $user@$host:/root/cryptotrader/backend/app/
+expect {
+    -re "assword:" {
+        send -- "$password\r"
+        exp_continue
+    }
+}
+expect eof
+
+# 2. Rebuild and Restart Backend
+spawn ssh -o StrictHostKeyChecking=no $user@$host "cd /root/cryptotrader && docker-compose build --no-cache backend && docker-compose up -d --force-recreate backend"
+expect {
+    -re "assword:" {
+        send -- "$password\r"
+        exp_continue
+    }
+}
+expect eof
